@@ -1,14 +1,45 @@
 # -*- coding: utf-8 -*-
 """
-Scoring des CVs par rapport a une description de poste
-Utilise la similarite cosinus entre embeddings
-Embede uniquement les sections pertinentes (competences, projets, experiences)
+Scoring Hybride Multi-stage RAG pour ResumeRadar
+
+Architecture : on passe d'un modele "Bi-Encoder" (similarite cosinus pure,
+rapide mais aveugle au contexte metier) a une architecture de "Reranking"
+en deux etapes :
+
+  Stage 1 - Bi-Encoder (30% du score final) :
+    Similarite cosinus entre embeddings du poste et des chunks du CV.
+    Rapide, permet un premier filtrage de masse.
+    Limite : la similarite mathematique ne comprend pas l'exclusion mutuelle.
+    Un avocat et un developpeur peuvent partager du vocabulaire ("contrat",
+    "livraison", "client") sans etre interchangeables.
+
+  Stage 2 - LLM Reranker (70% du score final) :
+    Le LLM lit le CV complet (jusqu'a DEFAULT_CONTEXT_WINDOW chars) et evalue
+    le candidat sur 3 criteres metier avec des scores de 0 a 100 :
+    - Adequation Metier : le candidat exerce-t-il le bon metier ?
+    - Maitrise des Hard Skills : possede-t-il les competences techniques demandees ?
+    - Experience Pertinente : a-t-il l'experience dans le domaine requis ?
+
+  Score Final = (Score_Cosinus * 0.3) + (Score_LLM * 0.7)
+
+Ce systeme elimine les "faux positifs" ou un juriste obtenait un score
+eleve pour un poste tech simplement parce que les deux textes partagent
+du vocabulaire general.
 """
 import re
+import json
 from typing import List, Dict
 import numpy as np
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from config.settings import EMBEDDING_MODEL
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from config.settings import (
+    EMBEDDING_MODEL,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    DEFAULT_CONTEXT_WINDOW,
+    SCORE_WEIGHT_COSINE,
+    SCORE_WEIGHT_LLM,
+)
 
 
 # Singleton pour le modele d'embeddings
@@ -31,111 +62,253 @@ def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     """Calcule la similarite cosinus entre deux vecteurs"""
     a = np.array(vec_a)
     b = np.array(vec_b)
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    norm_product = np.linalg.norm(a) * np.linalg.norm(b)
+    if norm_product == 0:
+        return 0.0
+    return float(np.dot(a, b) / norm_product)
 
 
-def extract_relevant_sections(text: str) -> str:
+def chunk_text(text: str) -> List[str]:
     """
-    Extrait les sections pertinentes d'un CV (competences, projets, experiences).
-    Si aucune section n'est trouvee, retourne le texte entier.
+    Decoupe le texte d'un CV en chunks avec chevauchement.
+    Utilise RecursiveCharacterTextSplitter pour couper intelligemment
+    aux frontieres de paragraphes/phrases plutot qu'au milieu d'un mot.
     """
-    # Mots-cles de sections pertinentes (FR + EN)
-    section_keywords = [
-        r"comp[ée]tences?",
-        r"skills?",
-        r"technologies?",
-        r"outils?",
-        r"tools?",
-        r"projets?",
-        r"projects?",
-        r"exp[ée]riences?",
-        r"experiences?",
-        r"r[ée]alisations?",
-        r"stack\s*technique",
-        r"technical\s*skills?",
-        r"langages?",
-        r"frameworks?",
-    ]
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len,
+    )
+    chunks = splitter.split_text(text)
+    return chunks if chunks else [text]
 
-    # Pattern pour detecter un titre de section
-    section_pattern = re.compile(
-        r"^[\s•\-]*(" + "|".join(section_keywords) + r")[\s:]*$",
-        re.IGNORECASE | re.MULTILINE
+
+def compute_cosine_score(job_description: str, cv_text: str) -> float:
+    """
+    Stage 1 : Score cosinus sur chunks.
+    Embede la description de poste et chaque chunk du CV separement,
+    puis retourne le score moyen des top-3 chunks les plus similaires.
+    Cela evite la perte d'information due a la troncature d'un embedding
+    unique sur un document entier.
+    """
+    embeddings = get_embeddings()
+    jd_embedding = embeddings.embed_query(job_description)
+
+    chunks = chunk_text(cv_text)
+    chunk_scores = []
+    for chunk in chunks:
+        chunk_embedding = embeddings.embed_query(chunk)
+        score = cosine_similarity(jd_embedding, chunk_embedding)
+        chunk_scores.append(score)
+
+    # Moyenne des top-3 chunks les plus pertinents
+    chunk_scores.sort(reverse=True)
+    top_chunks = chunk_scores[:min(3, len(chunk_scores))]
+    return sum(top_chunks) / len(top_chunks)
+
+
+# --- Prompt de Reranking LLM ---
+
+RERANKER_PROMPT = """Tu es un expert en recrutement. Tu dois evaluer objectivement si un candidat correspond a une offre d'emploi.
+
+DESCRIPTION DU POSTE :
+{job_description}
+
+CV DU CANDIDAT ({candidate_name}) :
+{cv_text}
+
+Evalue ce candidat sur exactement 3 criteres. Pour chaque critere, donne un score de 0 a 100 et une justification courte avec des citations du CV.
+
+Reponds UNIQUEMENT avec un JSON valide, sans texte avant ni apres, au format exact suivant :
+{{
+  "adequation_metier": {{
+    "score": <0-100>,
+    "justification": "<Le candidat exerce-t-il le bon metier pour ce poste ? Cite les elements du CV.>"
+  }},
+  "hard_skills": {{
+    "score": <0-100>,
+    "justification": "<Quelles competences techniques demandees sont presentes ou absentes ? Cite les technologies/outils trouves.>"
+  }},
+  "experience_pertinente": {{
+    "score": <0-100>,
+    "justification": "<Le candidat a-t-il de l'experience dans le domaine ou secteur requis ? Cite les postes/projets pertinents.>"
+  }}
+}}"""
+
+
+def compute_llm_score(
+    llm,
+    job_description: str,
+    candidate_name: str,
+    cv_text: str,
+) -> Dict:
+    """
+    Stage 2 : Reranking par LLM.
+    Le LLM evalue le candidat sur 3 criteres metier et retourne
+    des scores structures avec justifications.
+
+    Returns:
+        Dict avec 'score' (0-1), 'details' (les 3 criteres), 'evidence', 'warnings'
+    """
+    # Tronquer le CV a DEFAULT_CONTEXT_WINDOW pour rester dans les limites
+    # du modele local, tout en envoyant beaucoup plus que les 800 chars d'avant
+    truncated_cv = cv_text[:DEFAULT_CONTEXT_WINDOW]
+
+    prompt = RERANKER_PROMPT.format(
+        job_description=job_description,
+        candidate_name=candidate_name,
+        cv_text=truncated_cv,
     )
 
-    # Pattern pour detecter n'importe quel titre de section (pour delimiter la fin)
-    any_section_pattern = re.compile(
-        r"^[\s•\-]*[A-ZÀ-Ü][a-zà-ü]+(?:\s+[a-zà-ü&]+)*[\s:]*$",
-        re.MULTILINE
-    )
+    try:
+        raw_response = llm.invoke(prompt)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "cuda" in error_msg or "500" in error_msg or "memory" in error_msg:
+            return {
+                "score": 0.0,
+                "details": {
+                    "adequation_metier": {"score": 0, "justification": "GPU VRAM insuffisante"},
+                    "hard_skills": {"score": 0, "justification": "GPU VRAM insuffisante"},
+                    "experience_pertinente": {"score": 0, "justification": "GPU VRAM insuffisante"},
+                },
+                "evidence": [],
+                "warnings": [f"Reranking echoue (CUDA/memoire) pour {candidate_name}. Score base sur cosinus uniquement."],
+            }
+        raise
 
-    lines = text.split("\n")
-    relevant_parts = []
-    capturing = False
-    current_section = []
+    # Parser la reponse JSON du LLM
+    return _parse_llm_response(raw_response)
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if capturing:
-                current_section.append("")
-            continue
 
-        # Est-ce un titre de section pertinente ?
-        if section_pattern.match(stripped):
-            if current_section:
-                relevant_parts.extend(current_section)
-            current_section = [stripped]
-            capturing = True
-        # Est-ce un autre titre de section (fin de la section pertinente) ?
-        elif capturing and any_section_pattern.match(stripped) and not section_pattern.match(stripped):
-            if current_section:
-                relevant_parts.extend(current_section)
-                current_section = []
-            capturing = False
-        elif capturing:
-            current_section.append(stripped)
+def _parse_llm_response(raw_response: str) -> Dict:
+    """
+    Parse la reponse JSON du LLM reranker.
+    Gere les cas ou le LLM ajoute du texte autour du JSON
+    ou retourne un format invalide.
+    """
+    default = {
+        "score": 0.0,
+        "details": {
+            "adequation_metier": {"score": 0, "justification": "Evaluation impossible"},
+            "hard_skills": {"score": 0, "justification": "Evaluation impossible"},
+            "experience_pertinente": {"score": 0, "justification": "Evaluation impossible"},
+        },
+        "evidence": [],
+        "warnings": ["Le LLM n'a pas pu evaluer ce candidat"],
+    }
 
-    # Ajouter la derniere section capturee
-    if current_section:
-        relevant_parts.extend(current_section)
+    try:
+        # Extraire le JSON de la reponse (le LLM peut ajouter du texte autour)
+        json_match = re.search(r'\{[\s\S]*\}', raw_response)
+        if not json_match:
+            return default
 
-    result = "\n".join(relevant_parts).strip()
+        data = json.loads(json_match.group())
 
-    # Si rien de pertinent trouve, retourner le texte entier
-    if not result or len(result) < 50:
-        return text
+        # Extraire les scores des 3 criteres
+        scores = {}
+        evidence = []
+        warnings = []
 
-    return result
+        for key in ["adequation_metier", "hard_skills", "experience_pertinente"]:
+            if key in data and isinstance(data[key], dict):
+                score_val = data[key].get("score", 0)
+                # S'assurer que le score est un nombre entre 0 et 100
+                score_val = max(0, min(100, int(score_val)))
+                scores[key] = score_val
+
+                justification = data[key].get("justification", "")
+                if justification:
+                    evidence.append(f"{key}: {justification}")
+
+                # Detecter les points de vigilance (score < 40)
+                if score_val < 40:
+                    labels = {
+                        "adequation_metier": "Adequation metier faible",
+                        "hard_skills": "Hard skills insuffisantes",
+                        "experience_pertinente": "Experience non pertinente",
+                    }
+                    warnings.append(f"{labels[key]} ({score_val}/100) : {justification}")
+            else:
+                scores[key] = 0
+
+        # Score LLM = moyenne des 3 criteres, normalise entre 0 et 1
+        avg_score = sum(scores.values()) / (3 * 100)
+
+        return {
+            "score": avg_score,
+            "details": {k: data.get(k, {"score": 0, "justification": ""}) for k in scores},
+            "evidence": evidence,
+            "warnings": warnings,
+        }
+
+    except (json.JSONDecodeError, ValueError, KeyError):
+        return default
 
 
 def score_candidates(
     job_description: str,
     candidates: List[Dict],
-    top_n: int = 5
+    top_n: int = 5,
+    llm=None,
 ) -> List[Dict]:
     """
-    Score chaque candidat par rapport a la description de poste.
+    Scoring hybride multi-stage.
+
+    Stage 1 : Score cosinus sur chunks (filtrage rapide, poids 30%)
+    Stage 2 : Reranking LLM sur 3 criteres metier (poids 70%)
+    Score Final = (cosinus * 0.3) + (llm * 0.7)
 
     Args:
         job_description: Texte de la description de poste
         candidates: Liste de dicts avec 'name', 'email', 'text', 'filename'
         top_n: Nombre de candidats a retenir
+        llm: Instance du LLM Ollama pour le reranking
 
     Returns:
-        Liste des top_n candidats tries par score decroissant
+        Liste des top_n candidats tries par score hybride decroissant,
+        enrichis avec les justifications du LLM
     """
-    embeddings = get_embeddings()
-
-    # Embedding de la description de poste
-    jd_embedding = embeddings.embed_query(job_description)
-
-    # Scorer chaque candidat sur les sections pertinentes
+    # Stage 1 : Score cosinus par chunks
     for candidate in candidates:
-        relevant_text = extract_relevant_sections(candidate["text"])
-        cv_embedding = embeddings.embed_query(relevant_text)
-        candidate["score"] = cosine_similarity(jd_embedding, cv_embedding)
+        candidate["score_cosine"] = compute_cosine_score(
+            job_description, candidate["text"]
+        )
 
-    # Trier par score decroissant et garder les top_n
+    # Stage 2 : Reranking LLM (si le LLM est fourni)
+    if llm is not None:
+        for candidate in candidates:
+            llm_result = compute_llm_score(
+                llm,
+                job_description,
+                candidate["name"],
+                candidate["text"],
+            )
+            candidate["score_llm"] = llm_result["score"]
+            candidate["llm_details"] = llm_result["details"]
+            candidate["evidence"] = llm_result["evidence"]
+            candidate["warnings"] = llm_result["warnings"]
+
+        # Score hybride (fallback cosinus seul si LLM a echoue pour ce candidat)
+        for candidate in candidates:
+            if candidate["score_llm"] > 0:
+                candidate["score"] = (
+                    candidate["score_cosine"] * SCORE_WEIGHT_COSINE
+                    + candidate["score_llm"] * SCORE_WEIGHT_LLM
+                )
+            else:
+                candidate["score"] = candidate["score_cosine"]
+    else:
+        # Fallback : cosinus seul si pas de LLM
+        for candidate in candidates:
+            candidate["score"] = candidate["score_cosine"]
+            candidate["score_llm"] = 0.0
+            candidate["llm_details"] = {}
+            candidate["evidence"] = []
+            candidate["warnings"] = ["Reranking LLM non disponible"]
+
+    # Trier par score hybride decroissant
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_n]

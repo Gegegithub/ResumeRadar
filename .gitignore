@@ -28,6 +28,9 @@ chroma_db/
 data/*.pdf
 !data/.gitkeep
 
+# Documentation privee
+logic.md
+
 # Logs
 *.log
 

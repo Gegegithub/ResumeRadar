@@ -6,12 +6,12 @@ Premium SaaS Dark Mode UI
 import streamlit as st
 from urllib.parse import quote
 
-from config.settings import TOP_CANDIDATES, EMAIL_SUBJECT, EMAIL_BODY
+from config.settings import EMAIL_SUBJECT, EMAIL_BODY
 
 # Configuration de la page
 st.set_page_config(
     page_title="ResumeRadar",
-    page_icon="🎯",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -504,6 +504,18 @@ st.markdown("""
         font-size: 0.88rem;
     }
 
+    /* Masquer le texte brut "arrow_right" des icones Material dans les expanders.
+       Streamlit utilise des <span> avec la police Material Symbols. Si la police
+       ne charge pas, le texte "arrow_right" s'affiche en clair. On le cache. */
+    [data-testid="stExpander"] summary span[class*="icon"],
+    [data-testid="stExpander"] summary [data-testid="stIconMaterial"],
+    [data-testid="stExpander"] details summary > div > span:first-child,
+    [data-testid="stExpander"] summary span.material-symbols-rounded {
+        font-size: 0 !important;
+        width: 0 !important;
+        overflow: hidden !important;
+    }
+
     /* === ALERT BOXES === */
     [data-testid="stAlert"] {
         border-radius: 10px;
@@ -725,18 +737,20 @@ if mode == "Analyse":
     st.markdown('<div class="section-label">Description du poste</div>', unsafe_allow_html=True)
     job_description = st.text_area(
         "Description du poste",
-        height=140,
+        height=180,
         placeholder="Ex: Recherche Data Engineer Python avec experience Kafka, Spark, et SQL...",
         label_visibility="collapsed"
     )
 
-    # Slider
-    max_candidates = len(uploaded_files) if uploaded_files else TOP_CANDIDATES
-    top_n = st.slider(
+    # Nombre de candidats
+    max_candidates = len(uploaded_files) if uploaded_files else 100
+    top_n = st.number_input(
         "Candidats a retenir",
         min_value=1,
         max_value=max(max_candidates, 1),
-        value=min(TOP_CANDIDATES, max_candidates) if max_candidates > 0 else 1
+        value=None,
+        step=1,
+        placeholder="Entrez un nombre"
     )
 
     st.markdown("")  # spacing
@@ -748,14 +762,17 @@ if mode == "Analyse":
         from utils.email_extractor import extract_email
         from utils.scoring import score_candidates
         from utils.email_extractor import extract_name_from_filename
-        from langchain_community.llms import Ollama  # type: ignore
-        from config.settings import OLLAMA_MODEL, OLLAMA_BASE_URL, OLLAMA_TEMPERATURE
+        from langchain_ollama import OllamaLLM as Ollama
+        from config.settings import (
+            OLLAMA_MODEL, OLLAMA_BASE_URL, OLLAMA_TEMPERATURE,
+            OLLAMA_NUM_CTX, DEFAULT_CONTEXT_WINDOW,
+        )
 
         candidates = []
         progress = st.progress(0)
         status = st.empty()
 
-        # Extraction texte + email
+        # --- Etape 1 : Extraction texte + email ---
         for i, uploaded_file in enumerate(uploaded_files):
             status.text(f"Extraction de {uploaded_file.name}...")
             text = extract_text_from_pdf(uploaded_file)
@@ -772,40 +789,58 @@ if mode == "Analyse":
             })
             progress.progress((i + 1) / len(uploaded_files))
 
-        # Scoring par embeddings
-        status.text("Calcul des scores de pertinence...")
-        ranked = score_candidates(job_description, candidates, top_n)
-
-        # Analyse LLM
-        status.text("Analyse par le LLM...")
+        # --- Etape 2 : Scoring Hybride (cosinus + LLM reranker) ---
+        status.text("Initialisation du LLM...")
         llm = Ollama(
             model=OLLAMA_MODEL,
             base_url=OLLAMA_BASE_URL,
-            temperature=OLLAMA_TEMPERATURE
+            temperature=OLLAMA_TEMPERATURE,
+            num_ctx=OLLAMA_NUM_CTX,
         )
+
+        status.text("Scoring hybride en cours (embeddings + reranking LLM)...")
+        ranked = score_candidates(job_description, candidates, top_n, llm=llm)
+
+        # --- Etape 3 : Synthese finale par le LLM ---
+        # On utilise les resultats structures du reranker (evidence, warnings)
+        # au lieu de renvoyer le CV brut. Cela evite de depasser le num_ctx
+        # et elimine la confusion entre candidats.
+        status.text("Generation de la synthese finale...")
 
         candidates_summary = ""
         for i, c in enumerate(ranked):
             score_pct = int(c["score"] * 100)
+            cosine_pct = int(c.get("score_cosine", 0) * 100)
+            llm_pct = int(c.get("score_llm", 0) * 100)
+
+            # Scores detailles du reranker
+            details = c.get("llm_details", {})
+            details_str = ""
+            for key, label in [("adequation_metier", "Adequation Metier"),
+                               ("hard_skills", "Hard Skills"),
+                               ("experience_pertinente", "Experience")]:
+                d = details.get(key, {})
+                if isinstance(d, dict):
+                    details_str += f"  - {label}: {d.get('score', 0)}/100 — {d.get('justification', 'N/A')}\n"
+
+            # Warnings du reranker
+            warnings_str = ""
+            for w in c.get("warnings", []):
+                warnings_str += f"  - {w}\n"
+
             candidates_summary += (
-                f"\n--- Candidat {i+1}: {c['name']} (Score: {score_pct}%) ---\n"
-                f"{c['text'][:800]}\n"
+                f"\n--- {c['name']} (Hybride: {score_pct}% | Cosinus: {cosine_pct}% | LLM: {llm_pct}%) ---\n"
+                f"Evaluation detaillee :\n{details_str}"
+                f"Points de vigilance :\n{warnings_str if warnings_str else '  - Aucun\n'}"
             )
 
-        llm_prompt = f"""Tu es un assistant recruteur. Voici une description de poste et les candidats retenus.
+        llm_prompt = f"""Tu es un expert en recrutement. Voici les resultats d'evaluation de candidats pour un poste.
 
-DESCRIPTION DU POSTE :
-{job_description}
+POSTE : {job_description}
 
-CANDIDATS SELECTIONNES (tries par pertinence) :
+RESULTATS :
 {candidates_summary}
-
-Pour chaque candidat, explique en 2-3 lignes :
-1. Pourquoi il correspond au poste
-2. Ses points forts par rapport a la description
-3. Un point de vigilance eventuel
-
-Sois concis et precis."""
+Redige une synthese concise pour le recruteur. Pour chaque candidat, explique en 2-3 phrases si le profil correspond et pourquoi. Termine par une recommandation globale."""
 
         llm_analysis = llm.invoke(llm_prompt)
 
@@ -821,22 +856,15 @@ Sois concis et precis."""
 
         st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
 
-        # LLM Analysis
-        st.markdown("""
-        <div class="llm-card">
-            <div class="llm-label">Recommandations du LLM</div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.markdown(st.session_state.review_analysis)
-
-        # Classement
-        st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Classement</div>', unsafe_allow_html=True)
+        # Classement Hybride
+        st.markdown('<div class="section-title">Classement Hybride</div>', unsafe_allow_html=True)
         st.markdown("")
 
         recap_data = []
         for c in st.session_state.review_candidates:
             score_pct = int(c["score"] * 100)
+            cosine_pct = int(c.get("score_cosine", 0) * 100)
+            llm_pct = int(c.get("score_llm", 0) * 100)
             if score_pct >= 70:
                 indicator = "🟢"
             elif score_pct >= 50:
@@ -846,11 +874,57 @@ Sois concis et precis."""
             recap_data.append({
                 "": indicator,
                 "Candidat": c["name"],
-                "Score": f"{score_pct}%",
+                "Hybride": f"{score_pct}%",
+                "Cosinus": f"{cosine_pct}%",
+                "LLM": f"{llm_pct}%",
                 "Email": c["email"] if c["email"] else "N/A"
             })
 
         st.table(recap_data)
+
+        # Detail par candidat : preuves et vigilance
+        for c in st.session_state.review_candidates:
+            score_pct = int(c["score"] * 100)
+            score_class = get_score_class(score_pct)
+
+            with st.expander(f"{c['name']} — Score Hybride : {score_pct}%"):
+                # Scores detailles
+                details = c.get("llm_details", {})
+                if details:
+                    cols = st.columns(3)
+                    labels = {
+                        "adequation_metier": "Adequation Metier",
+                        "hard_skills": "Hard Skills",
+                        "experience_pertinente": "Experience",
+                    }
+                    for i, (key, label) in enumerate(labels.items()):
+                        with cols[i]:
+                            detail = details.get(key, {})
+                            detail_score = detail.get("score", 0) if isinstance(detail, dict) else 0
+                            st.metric(label, f"{detail_score}/100")
+
+                # Preuves trouvees
+                evidence = c.get("evidence", [])
+                if evidence:
+                    st.markdown("**Preuves trouvees :**")
+                    for e in evidence:
+                        st.markdown(f"- {e}")
+
+                # Points de vigilance
+                warnings = c.get("warnings", [])
+                if warnings:
+                    st.markdown("**Points de vigilance :**")
+                    for w in warnings:
+                        st.warning(w)
+
+        # Synthese LLM
+        st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="llm-card">
+            <div class="llm-label">Synthese du LLM</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown(st.session_state.review_analysis)
 
         st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
         st.info("Passez en mode **CVs & Contact** pour consulter les CVs et contacter les candidats.")
