@@ -1,7 +1,7 @@
-# ResumeRadar
+# Resume
 
 ## Apercu
-
+https://github.com/user-attachments/assets/b5de7757-b348-43a4-91a7-6d87c61330c3
 **Application 100% locale pour analyser et trier des CVs par rapport a une description de poste**
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
