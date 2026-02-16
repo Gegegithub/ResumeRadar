@@ -1,6 +1,6 @@
 # Resume
 
-## Apercu
+## Demo
 
 **Application 100% locale pour analyser et trier des CVs par rapport a une description de poste**
 
